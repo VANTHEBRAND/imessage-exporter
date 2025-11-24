@@ -24,6 +24,7 @@ fn main() -> ExitCode {
             Ok(mut app) => {
                 // Resolve the filtered contacts, if provided
                 app.resolve_filtered_handles();
+                app.resolve_filtered_groups();
 
                 if let Err(why) = app.start() {
                     eprintln!("Unable to export: {why}");
