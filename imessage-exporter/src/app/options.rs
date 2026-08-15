@@ -495,7 +495,7 @@ fn get_command() -> Command {
             Arg::new(OPTION_GROUP_FILTER)
                 .short('g')
                 .long(OPTION_GROUP_FILTER)
-                .help("Filter exported group conversations by their names\nTo provide multiple group names, use a comma-separated string\nExample: `-g \"Family Chat,Work Group\"`\n")
+                .help("Filter exported group conversations by their names\nTo provide multiple group names, use a comma-separated string\nWhen combined with --conversation-filter, only conversations matching both filters are exported\nExample: `-g \"Family Chat,Work Group\"`\n")
                 .display_order(14)
                 .value_name("group_name"),
         )
@@ -955,7 +955,28 @@ mod arg_tests {
             command.get_matches_from(["imessage-exporter", "-g", "Family Chat", "-f", "txt"]);
 
         let actual = Options::from_args(&args).unwrap();
-        assert_eq!(actual.group_filter, Some(String::from("Family Chat")));
+
+        let expected = Options {
+            db_path: default_db_path(),
+            attachment_root: None,
+            attachment_manager: AttachmentManager::from(AttachmentManagerMode::Disabled),
+            diagnostic: false,
+            export_type: Some(ExportType::Txt),
+            export_path: validate_path(None, None).unwrap(),
+            query_context: QueryContext::default(),
+            no_lazy: false,
+            custom_name: None,
+            use_caller_id: false,
+            platform: Platform::default(),
+            ignore_disk_space: false,
+            conversation_filter: None,
+            group_filter: Some(String::from("Family Chat")),
+            cleartext_password: None,
+            contacts_path: None,
+            show_progress: true,
+        };
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -22,11 +22,13 @@ fn main() -> ExitCode {
     match options {
         Ok(options) => match Config::new(options) {
             Ok(mut app) => {
-                // Resolve the filtered contacts, if provided
-                app.resolve_filtered_handles();
-                app.resolve_filtered_groups();
+                let result = (|| {
+                    app.resolve_filtered_handles()?;
+                    app.resolve_filtered_groups()?;
+                    app.start()
+                })();
 
-                if let Err(why) = app.start() {
+                if let Err(why) = result {
                     eprintln!("Unable to export: {why}");
                     return ExitCode::FAILURE;
                 }

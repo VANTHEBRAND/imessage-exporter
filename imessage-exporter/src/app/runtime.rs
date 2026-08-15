@@ -59,8 +59,6 @@ pub struct Config {
     pub translated_messages: HashSet<String>,
     /// Parsed application options.
     pub options: Options,
-    /// Whether the group filter matched at least one selected chat.
-    pub group_filter_matches: bool,
     /// Unix timestamp offset for the Messages epoch.
     pub offset: i64,
     /// Database and contact data source.
@@ -283,7 +281,6 @@ impl Config {
             tapbacks,
             translated_messages,
             options,
-            group_filter_matches: false,
             offset: get_offset(),
             data_source,
         })
@@ -291,100 +288,115 @@ impl Config {
 
     // MARK: Filters
     /// Resolve a comma-separated participant filter into chat and handle IDs.
-    pub(crate) fn resolve_filtered_handles(&mut self) {
-        if let Some(conversation_filter) = &self.options.conversation_filter {
-            let parsed_handle_filter = conversation_filter.split(',').collect::<Vec<&str>>();
+    pub(crate) fn resolve_filtered_handles(&mut self) -> Result<(), RuntimeError> {
+        let Some(conversation_filter) = &self.options.conversation_filter else {
+            return Ok(());
+        };
 
-            let mut included_chatrooms: BTreeSet<i32> = BTreeSet::new();
-            let mut included_handles: BTreeSet<i32> = BTreeSet::new();
+        let parsed_handle_filter = conversation_filter
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<&str>>();
 
-            // First, resolve matching participant names to handle IDs.
-            self.participants.iter().for_each(|(_, handle_name)| {
-                for included_name in &parsed_handle_filter {
-                    if handle_name.contains(included_name) {
-                        included_handles.extend(&handle_name.handle_ids);
-                    }
+        let mut included_chatrooms: BTreeSet<i32> = BTreeSet::new();
+        let mut included_handles: BTreeSet<i32> = BTreeSet::new();
+
+        // First, resolve matching participant names to handle IDs.
+        self.participants.iter().for_each(|(_, handle_name)| {
+            for included_name in &parsed_handle_filter {
+                if handle_name.contains(included_name) {
+                    included_handles.extend(&handle_name.handle_ids);
+                }
+            }
+        });
+
+        // Then include chats that contain any selected handle.
+        self.chatroom_participants
+            .iter()
+            .for_each(|(chat_id, participants)| {
+                if !participants.is_disjoint(&included_handles) {
+                    included_chatrooms.insert(*chat_id);
                 }
             });
 
-            // Then include chats that contain any selected handle.
-            self.chatroom_participants
-                .iter()
-                .for_each(|(chat_id, participants)| {
-                    if !participants.is_disjoint(&included_handles) {
-                        included_chatrooms.insert(*chat_id);
-                    }
-                });
-
-            self.options
-                .query_context
-                .set_selected_handle_ids(included_handles);
-
-            self.options
-                .query_context
-                .set_selected_chat_ids(included_chatrooms);
-
-            self.log_filtered_handles_and_chats();
+        if included_chatrooms.is_empty() {
+            return Err(RuntimeError::InvalidOptions(format!(
+                "Selected filter `{conversation_filter}` does not match any participants!"
+            )));
         }
+
+        self.options
+            .query_context
+            .set_selected_handle_ids(included_handles);
+        self.options
+            .query_context
+            .set_selected_chat_ids(included_chatrooms);
+
+        self.log_filtered_handles_and_chats();
+        Ok(())
     }
 
     /// Resolve a comma-separated group-name filter into matching chat IDs.
-    pub(crate) fn resolve_filtered_groups(&mut self) {
-        self.group_filter_matches = false;
+    pub(crate) fn resolve_filtered_groups(&mut self) -> Result<(), RuntimeError> {
+        let Some(group_filter) = &self.options.group_filter else {
+            return Ok(());
+        };
 
-        if let Some(group_filter) = &self.options.group_filter {
-            let parsed_group_filter = group_filter
-                .split(',')
-                .map(str::trim)
-                .filter(|token| !token.is_empty())
-                .collect::<Vec<&str>>();
+        let parsed_group_filter = group_filter
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<&str>>();
 
-            let matched_chat_ids: BTreeSet<i32> = self
-                .chatrooms
-                .iter()
-                .filter_map(|(&chat_id, chat)| {
-                    let chat_name = chat.name();
-                    if parsed_group_filter
-                        .iter()
-                        .any(|included_name| chat_name.contains(included_name))
-                    {
-                        Some(chat_id)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+        let matched_chat_ids: BTreeSet<i32> = self
+            .chatrooms
+            .iter()
+            .filter_map(|(&chat_id, chat)| {
+                chat.display_name()
+                    .is_some_and(|chat_name| {
+                        parsed_group_filter
+                            .iter()
+                            .any(|included_name| chat_name.contains(included_name))
+                    })
+                    .then_some(chat_id)
+            })
+            .collect();
 
-            if matched_chat_ids.is_empty() {
-                self.group_filter_matches = false;
-                return;
-            }
-
-            match &self.options.query_context.selected_chat_ids {
-                Some(existing) => {
-                    let intersection = existing
-                        .intersection(&matched_chat_ids)
-                        .copied()
-                        .collect::<BTreeSet<i32>>();
-
-                    if intersection.is_empty() {
-                        self.group_filter_matches = false;
-                        return;
-                    }
-
-                    self.options
-                        .query_context
-                        .set_selected_chat_ids(intersection);
-                }
-                None => {
-                    self.options
-                        .query_context
-                        .set_selected_chat_ids(matched_chat_ids.clone());
-                }
-            }
-
-            self.group_filter_matches = true;
+        if matched_chat_ids.is_empty() {
+            return Err(RuntimeError::InvalidOptions(format!(
+                "Selected group filter `{group_filter}` does not match any named chats!"
+            )));
         }
+
+        let selected_chat_ids = match &self.options.query_context.selected_chat_ids {
+            Some(existing) => {
+                let intersection = existing
+                    .intersection(&matched_chat_ids)
+                    .copied()
+                    .collect::<BTreeSet<i32>>();
+
+                if intersection.is_empty() {
+                    let message = match &self.options.conversation_filter {
+                        Some(conversation_filter) => format!(
+                            "Selected conversation filter `{conversation_filter}` and group filter `{group_filter}` do not match any of the same chats!"
+                        ),
+                        None => format!(
+                            "Selected group filter `{group_filter}` does not overlap with the conversations selected by other filters!"
+                        ),
+                    };
+                    return Err(RuntimeError::InvalidOptions(message));
+                }
+
+                intersection
+            }
+            None => matched_chat_ids,
+        };
+
+        self.options
+            .query_context
+            .set_selected_chat_ids(selected_chat_ids);
+        Ok(())
     }
 
     /// Log the number of handles and chats selected by the participant filter.
@@ -614,22 +626,6 @@ impl Config {
         if self.options.diagnostic {
             self.run_diagnostic()?;
         } else if let Some(export_type) = &self.options.export_type {
-            if let Some(filters) = &self.options.conversation_filter
-                && !self.options.query_context.has_filters()
-            {
-                return Err(RuntimeError::InvalidOptions(format!(
-                    "Selected filter `{filters}` does not match any participants!"
-                )));
-            }
-
-            if let Some(filters) = &self.options.group_filter
-                && !self.group_filter_matches
-            {
-                return Err(RuntimeError::InvalidOptions(format!(
-                    "Selected group filter `{filters}` does not match any chats!"
-                )));
-            }
-
             // Ensure the path we want to export to exists
             create_dir_all(&self.options.export_path)?;
 
@@ -708,7 +704,6 @@ impl Config {
             tapbacks: HashMap::new(),
             translated_messages: HashSet::new(),
             options,
-            group_filter_matches: false,
             offset: get_offset(),
             data_source,
         }
@@ -1334,7 +1329,7 @@ mod chat_filter_tests {
     #[test]
     fn can_generate_filter_string_multiple() {
         let mut options = Options::fake_options(ExportType::Html);
-        options.conversation_filter = Some(String::from("Person 10,Person 11,Person 12"));
+        options.conversation_filter = Some(String::from(" Person 10, Person 11, ,Person 12 "));
 
         let mut app = Config::fake_app(options);
 
@@ -1381,7 +1376,7 @@ mod chat_filter_tests {
         chatroom_6.insert(13); // Even though this person is excluded, the above person is
         app.chatroom_participants.insert(6, chatroom_6);
 
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
         // For the test, sort the output so it is always the same
 
         assert_eq!(
@@ -1444,7 +1439,7 @@ mod chat_filter_tests {
         chatroom_6.insert(13); // Even though this person is excluded, the above person is
         app.chatroom_participants.insert(6, chatroom_6);
 
-        app.resolve_filtered_handles();
+        app.resolve_filtered_handles().unwrap();
         // For the test, sort the output so it is always the same
 
         assert_eq!(
@@ -1467,9 +1462,21 @@ mod group_filter_tests {
         app::{contacts::Name, export_type::ExportType, runtime::filename_tests::fake_chat},
     };
 
-    /// Verify that when the group filter matches no chats, the conversation filter is still honored.
+    fn insert_chat(
+        app: &mut Config,
+        rowid: i32,
+        display_name: Option<&str>,
+        chat_identifier: &str,
+    ) {
+        let mut chat = fake_chat();
+        chat.rowid = rowid;
+        chat.display_name = display_name.map(str::to_string);
+        chat.chat_identifier = chat_identifier.to_string();
+        app.chatrooms.insert(rowid, chat);
+    }
+
     #[test]
-    fn group_filter_with_no_overlap_preserves_existing_selection() {
+    fn disjoint_conversation_and_group_filters_return_no_overlap_error() {
         let mut options = Options::fake_options(ExportType::Html);
         options.conversation_filter = Some(String::from("Person 11"));
         options.group_filter = Some(String::from("Work"));
@@ -1485,15 +1492,8 @@ mod group_filter_tests {
             participant.handle_ids.insert(*id);
         }
 
-        let mut chat1 = fake_chat();
-        chat1.rowid = 1;
-        chat1.display_name = Some("Family Chat".to_string());
-        app.chatrooms.insert(1, chat1);
-
-        let mut chat2 = fake_chat();
-        chat2.rowid = 2;
-        chat2.display_name = Some("Work Chat".to_string());
-        app.chatrooms.insert(2, chat2);
+        insert_chat(&mut app, 1, Some("Family Chat"), "family-chat");
+        insert_chat(&mut app, 2, Some("Work Chat"), "work-chat");
 
         let mut chatroom_1 = BTreeSet::new();
         chatroom_1.insert(11);
@@ -1503,14 +1503,13 @@ mod group_filter_tests {
         chatroom_2.insert(10);
         app.chatroom_participants.insert(2, chatroom_2);
 
-        app.resolve_filtered_handles();
-        app.resolve_filtered_groups();
+        app.resolve_filtered_handles().unwrap();
+        let error = app.resolve_filtered_groups().unwrap_err();
 
         assert_eq!(
-            app.options.query_context.selected_chat_ids,
-            Some(BTreeSet::from([1]))
+            error.to_string(),
+            "Invalid options!\nSelected conversation filter `Person 11` and group filter `Work` do not match any of the same chats!"
         );
-        assert!(!app.group_filter_matches);
     }
 
     #[test]
@@ -1520,14 +1519,10 @@ mod group_filter_tests {
 
         let mut app = Config::fake_app(options);
 
-        let mut chat = fake_chat();
-        chat.rowid = 1;
-        chat.display_name = Some("Family Chat".to_string());
-        app.chatrooms.insert(chat.rowid, chat);
+        insert_chat(&mut app, 1, Some("Family Chat"), "family-chat");
 
-        app.resolve_filtered_groups();
+        app.resolve_filtered_groups().unwrap();
 
-        assert!(app.group_filter_matches);
         assert_eq!(
             app.options.query_context.selected_chat_ids,
             Some(BTreeSet::from([1]))
@@ -1535,20 +1530,58 @@ mod group_filter_tests {
     }
 
     #[test]
-    fn group_filter_not_matching_sets_flag_false() {
+    fn can_filter_multiple_trimmed_group_names() {
+        let mut options = Options::fake_options(ExportType::Html);
+        options.group_filter = Some(String::from(" ⛓️ , , Work "));
+
+        let mut app = Config::fake_app(options);
+
+        insert_chat(&mut app, 1, Some("⛓️"), "chain-chat");
+        insert_chat(&mut app, 2, Some("Work Group"), "work-chat");
+        insert_chat(&mut app, 3, Some("Friends"), "friends-chat");
+
+        app.resolve_filtered_groups().unwrap();
+
+        assert_eq!(
+            app.options.query_context.selected_chat_ids,
+            Some(BTreeSet::from([1, 2]))
+        );
+    }
+
+    #[test]
+    fn group_filter_ignores_identifiers_and_empty_display_names() {
+        let mut options = Options::fake_options(ExportType::Html);
+        options.group_filter = Some(String::from("Family"));
+
+        let mut app = Config::fake_app(options);
+
+        insert_chat(&mut app, 1, None, "Family Chat");
+        insert_chat(&mut app, 2, Some(""), "Family Group");
+
+        let error = app.resolve_filtered_groups().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid options!\nSelected group filter `Family` does not match any named chats!"
+        );
+        assert!(app.options.query_context.selected_chat_ids.is_none());
+    }
+
+    #[test]
+    fn unmatched_group_filter_returns_named_chat_error() {
         let mut options = Options::fake_options(ExportType::Html);
         options.group_filter = Some(String::from("Secret"));
 
         let mut app = Config::fake_app(options);
 
-        let mut chat = fake_chat();
-        chat.rowid = 1;
-        chat.display_name = Some("Family Chat".to_string());
-        app.chatrooms.insert(chat.rowid, chat);
+        insert_chat(&mut app, 1, Some("Family Chat"), "family-chat");
 
-        app.resolve_filtered_groups();
+        let error = app.resolve_filtered_groups().unwrap_err();
 
-        assert!(!app.group_filter_matches);
+        assert_eq!(
+            error.to_string(),
+            "Invalid options!\nSelected group filter `Secret` does not match any named chats!"
+        );
         assert!(app.options.query_context.selected_chat_ids.is_none());
     }
 
@@ -1569,15 +1602,8 @@ mod group_filter_tests {
             participant.handle_ids.insert(*id);
         }
 
-        let mut chat1 = fake_chat();
-        chat1.rowid = 1;
-        chat1.display_name = Some("Family Chat".to_string());
-        app.chatrooms.insert(1, chat1);
-
-        let mut chat2 = fake_chat();
-        chat2.rowid = 2;
-        chat2.display_name = Some("Work Chat".to_string());
-        app.chatrooms.insert(2, chat2);
+        insert_chat(&mut app, 1, Some("Family Chat"), "family-chat");
+        insert_chat(&mut app, 2, Some("Work Chat"), "work-chat");
 
         let mut chatroom_1 = BTreeSet::new();
         chatroom_1.insert(11);
@@ -1587,13 +1613,37 @@ mod group_filter_tests {
         chatroom_2.insert(11);
         app.chatroom_participants.insert(2, chatroom_2);
 
-        app.resolve_filtered_handles();
-        app.resolve_filtered_groups();
+        app.resolve_filtered_handles().unwrap();
+        app.resolve_filtered_groups().unwrap();
 
         assert_eq!(
             app.options.query_context.selected_chat_ids,
             Some(BTreeSet::from([1]))
         );
-        assert!(app.group_filter_matches);
+    }
+
+    #[test]
+    fn valid_group_filter_does_not_mask_invalid_participant_filter() {
+        let mut options = Options::fake_options(ExportType::Html);
+        options.conversation_filter = Some(String::from("Missing Person"));
+        options.group_filter = Some(String::from("Family"));
+
+        let mut app = Config::fake_app(options);
+
+        app.participants.insert(11, Name::fake_name("Person 11"));
+        app.participants.get_mut(&11).unwrap().handle_ids.insert(11);
+        app.chatroom_participants.insert(1, BTreeSet::from([11]));
+        insert_chat(&mut app, 1, Some("Family Chat"), "family-chat");
+
+        let error = app
+            .resolve_filtered_handles()
+            .and_then(|()| app.resolve_filtered_groups())
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid options!\nSelected filter `Missing Person` does not match any participants!"
+        );
+        assert!(app.options.query_context.selected_chat_ids.is_none());
     }
 }

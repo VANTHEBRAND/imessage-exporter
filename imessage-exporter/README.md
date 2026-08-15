@@ -116,9 +116,8 @@ The [releases page](https://github.com/ReagentX/imessage-exporter/releases) prov
 -g, --group-filter <group_name>
         Filter exported group conversations by their names
         To provide multiple group names, use a comma-separated string
+        When combined with --conversation-filter, only conversations matching both filters are exported
         Example: `-g "Family Chat,Work Group"`
-
-Note: When both `--conversation-filter` and `--group-filter` are specified, only conversations that match both filters (intersection) will be exported.
 
 -x, --cleartext-password <password>
         Optional password for encrypted iOS backups
